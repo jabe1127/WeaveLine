@@ -1,0 +1,1484 @@
+--[[ WeaveLine ------------------------------------------------------------
+  Two-track shot timing for TBC hunters.
+
+  PLAN (bottom) is free-running. Its phase is set once and then advances
+  by its own simulation, so it never snaps to your real shots -- drift
+  between the lanes is the signal that you are off rotation.
+
+  Placement is by PRIORITY, not by a fixed five-step template:
+      Multi-Shot if it is off cooldown at the moment the GCD frees
+      else Arcane Shot if it is off cooldown
+      else nothing -- Steady and auto only, which is a weave cycle
+  Because a cooldown ticks down at the same rate the bar scrolls, a
+  placement decided this way sits still on screen. The old step counter
+  re-derived on every auto, which is what made it jump.
+
+  ACTUAL (top) is what you really cast.
+
+    red     auto shot        yellow  Steady casting
+    orange  GCD gap          violet  Multi-Shot      pink  Arcane Shot
+
+  Timing ported from Bouk's Hunter Castbar: cast = tooltip / haste,
+  haste includes quiver, auto = reload(eWS - 0.5/haste) then a hasted
+  0.5s cast. The auto is blocked by casts only, never by the GCD.
+
+  v2.1
+--------------------------------------------------------------------------]]
+
+local CONFIG = {
+  width       = 425,
+  laneH       = 27,
+  laneGap     = 5,
+  pad         = 0,
+  border      = 4,          -- outline thickness
+  textGap     = 7,          -- clearance between text and the border
+
+  impactMelee = 0.50,       -- punch duration for a plain melee swing
+  impactRaptor= 0.80,       -- Raptor gets a longer, bigger one
+  impactBlinks= 3,          -- pulses of grey/white inside that window
+  impactScale = 0.10,       -- peak expansion; the main tactile cue
+  impactPeak  = 0.90,       -- flash alpha at the instant of the hit
+  impactPop   = 5,          -- extra border px at peak
+
+  showActual  = false,   -- the YOU lane; useful on review, noise in play
+  idleAlpha   = 0.10,    -- out of combat but on an enemy target
+  hideNoTarget= true,
+  noTargetFade= 2.0,        -- seconds without a hostile target before fading
+
+  cycles      = 3.0,
+  linePos     = 0.22,
+
+  lineWidth   = 3,
+  gcd         = 1.5,
+  arcaneWidth = 0.12,
+  multiCD     = 10,
+  arcaneCD    = 6,
+  -- "french" = the doc's fixed 5:5:1:1 (multi on step 1, arcane on step 3).
+  -- "priority" = fire each instant whenever its cooldown is up, which
+  -- over-fires Arcane relative to the doc. French is the correct default.
+  mode        = "french",
+  -- Bouk's Duration Info multiplies ranged haste in twice. It reads like
+  -- a slip, but his bar is the one that visibly tracks the shots, so
+  -- match it by default. /wl squarehaste flips to the plain reading.
+  squareHaste = true,
+  separators  = true,    -- leading-edge bar at each press moment
+  sepWidth    = 3,
+  sepBright   = 0.55,    -- how far the separator lightens toward white
+  sepOverhang = 0,       -- px the separator extends past the lane, each end
+
+  -- Melee swing timer: a thin fill along the bottom edge. Swing timing
+  -- is continuous rather than scheduled, so it does not belong on the
+  -- scrolling track.
+  swingBar    = true,
+  swingH      = 6,
+  swingGap    = 0,       -- 0 = flush under the border, no overlap
+  swingStale  = 2.2,     -- hide after this many swing periods with no hit
+
+  -- "tail"   idle drawn as a dim continuation of whatever caused it
+  -- "block"  idle drawn as its own solid colour
+  -- "hidden" idle not drawn at all
+  idleStyle   = "tail",
+  idleTailAlpha = 0.30,
+  idleMin     = 0.10,    -- seconds; shorter idles are not drawn
+  ticks       = false,
+
+  -- Phase lock. Notes are generated from ideal timing, but real autos
+  -- clip, so the schedule drifts ahead of reality. Rather than rebuild
+  -- notes (which made the bar jump), the whole track is slid by a
+  -- correction that eases in at slewRate seconds per second -- slow
+  -- enough to be invisible, fast enough to stay locked.
+  -- Hold the timeline at each auto shot until the real one fires. A
+  -- clip becomes a visible stall whose length is exactly how late you
+  -- were, instead of drift you never see. Handles reality being LATE;
+  -- the slew below still handles reality being early.
+  gateOnAuto  = true,
+  gateMax     = 1.5,     -- seconds; never stall longer than this
+
+  phaseLock   = true,
+  -- Converge the whole error within this many seconds, whatever its
+  -- size. A fixed rate only tracks if drift is slower than the rate;
+  -- if real clips exceed the model it falls permanently behind.
+  slewTime    = 0.35,
+  slewRate    = 0.25,    -- floor, so tiny errors still close
+  gloss       = true,
+
+  -- Idle fills its slot like any other segment. Drawing it short left a
+  -- thin bar running through the centre of the whole bar, which read as
+  -- an artifact rather than as information.
+  idleHeight  = 1.00,     -- fraction of lane height; 1 = full block
+  showIdle    = true,
+
+  -- Second melee probe: inside 10 yards while Auto Shot reports out of
+  -- range means you are inside its minimum, i.e. melee. Backs up Wing
+  -- Clip in case that check lags.
+  meleeUseAutoShot = true,
+
+  debug       = false,
+}
+
+local C = {
+  panel   = { 0.045, 0.050, 0.065, 0.96 },
+  track   = { 0.100, 0.110, 0.135, 1.00 },
+  sheen   = { 1.000, 1.000, 1.000, 0.07 },
+  sep     = { 0.000, 0.000, 0.000, 1.00 },
+  swingUp = { 0.090, 0.44, 0.16, 1.00 },   -- Raptor ready (dark green)
+  swingCd = { 0.520, 0.54, 0.60, 1.00 },   -- Raptor on cooldown
+  swingBg = { 0.120, 0.13, 0.15, 0.90 },
+  edge    = { 0.015, 0.015, 0.022, 1.00 },
+  hairline= { 1.000, 1.000, 1.000, 0.05 },
+
+  auto    = { 0.82, 0.23, 0.26 },
+  steady  = { 0.95, 0.74, 0.22 },
+  down    = { 0.90, 0.87, 0.78 },   -- cream: downtime / GCD gap
+  weave   = { 1.00, 0.55, 0.12 },
+  multi   = { 0.58, 0.36, 0.90 },
+  arcane  = { 0.96, 0.34, 0.70 },
+
+  tick    = { 1.00, 1.00, 1.00, 0.30 },
+
+  -- Border by range to target.
+  rngFar    = { 0.90, 0.15, 0.15, 1.00 },   -- out of shooting range
+  rngRanged = { 0.20, 0.45, 0.95, 1.00 },   -- ~10 to 35 yards
+  rngStep   = { 0.20, 1.00, 0.25, 1.00 },   -- one tap of W from melee
+  rngMelee  = { 1.00, 0.95, 0.10, 1.00 },   -- in melee
+  impact    = { 1.00, 1.00, 1.00, 1.00 },
+  line    = { 1.00, 0.97, 0.45 },
+  dim     = { 0.55, 0.57, 0.65 },
+}
+
+--------------------------------------------------------------------------
+-- Shims
+--------------------------------------------------------------------------
+
+local function spellInfo(x)
+  if C_Spell and C_Spell.GetSpellInfo then
+    local t = C_Spell.GetSpellInfo(x)
+    if t then return t.name, t.iconID, (t.castTime or 0) end
+  end
+  local n, _, i, ct = GetSpellInfo(x)
+  return n, i, ct or 0
+end
+
+local function spellCD(x)
+  if C_Spell and C_Spell.GetSpellCooldown then
+    local c = C_Spell.GetSpellCooldown(x)
+    if c then return c.startTime or 0, c.duration or 0 end
+  end
+  local s, d = GetSpellCooldown(x)
+  return s or 0, d or 0
+end
+
+local function bagName(i)
+  if C_Container and C_Container.GetBagName then return C_Container.GetBagName(i) end
+  if GetBagName then return GetBagName(i) end
+end
+
+-- Flat fill with a vertical gloss. No texture art: it made the bar
+-- busy without making segments easier to tell apart.
+local function paint(tex, c, alpha)
+  local r, g, b = c[1], c[2], c[3]
+  tex:SetColorTexture(r, g, b, alpha)
+  if CONFIG.gloss and tex.SetGradient and CreateColor then
+    pcall(function()
+      tex:SetGradient("VERTICAL",
+        CreateColor(r * 0.52, g * 0.52, b * 0.52, alpha),
+        CreateColor(math.min(1, r * 1.22), math.min(1, g * 1.22), math.min(1, b * 1.22), alpha))
+    end)
+  end
+end
+
+--------------------------------------------------------------------------
+-- Haste (GetRangedHaste omits quiver)
+--------------------------------------------------------------------------
+
+local QUIVER = {}
+do
+  local map = {
+    [1.15] = {18714,19320,19319,29118,34106,29143,29144,34100,34099},
+    [1.14] = {2663,2662},  [1.13] = {7372,7371},
+    [1.12] = {8218,8217},  [1.11] = {3604,3605},
+    [1.10] = {2101,5439,7278,11362,3574,5441,7279,11363,2102},
+  }
+  for h, ids in pairs(map) do for _, id in ipairs(ids) do QUIVER[id] = h end end
+end
+
+local function haste()
+  local h = 1 + ((GetRangedHaste and GetRangedHaste() or 0) / 100)
+  for i = 1, 4 do
+    local nm = bagName(i)
+    if nm then
+      local id = GetItemInfoInstant and GetItemInfoInstant(nm)
+      if id and QUIVER[id] then return h * QUIVER[id] end
+    end
+  end
+  return h
+end
+
+--------------------------------------------------------------------------
+-- Spells and timings
+--------------------------------------------------------------------------
+
+local SPELL = {}
+local function resolve()
+  SPELL.auto   = (spellInfo(75))    or "Auto Shot"
+  SPELL.steady = (spellInfo(34120)) or "Steady Shot"
+  SPELL.multi  = (spellInfo(2643))  or "Multi-Shot"
+  SPELL.arcane = (spellInfo(3044))  or "Arcane Shot"
+  SPELL.raptor = (spellInfo(2973))  or "Raptor Strike"
+end
+
+local function ews() return (UnitRangedDamage("player")) or 0 end
+
+local function castOf(x)
+  local _, _, ct = spellInfo(x)
+  return math.max(ct or 0, 500) / 1000 / haste()
+end
+
+local function steadyCast() return castOf(SPELL.steady) end
+local function multiCast()  return castOf(SPELL.multi)  end
+
+local function autoCast()
+  local h = haste()
+  if CONFIG.squareHaste then
+    h = h * (1 + ((GetRangedHaste and GetRangedHaste() or 0) / 100))
+  end
+  return 0.5 / h
+end
+
+local function meleeSpeed()
+  local mh = UnitAttackSpeed("player")
+  return (mh and mh > 0) and mh or 2.0
+end
+
+local function reload()
+  local r = ews() - autoCast()
+  return r > 0 and r or 0
+end
+
+local function cdLeft(name)
+  local s, d = spellCD(name)
+  if not s or s == 0 then return 0 end
+  local r = (s + d) - GetTime()
+  return r > 0 and r or 0
+end
+
+--------------------------------------------------------------------------
+-- State
+--------------------------------------------------------------------------
+
+local state = {
+  lastAuto = 0,
+  plan     = {},      -- committed notes; never rewritten once placed
+  actual   = {},
+  lastClip = 0,
+
+  slew         = 0,      -- correction currently applied to the display
+  slewTarget   = 0,
+  lastPhaseErr = 0,
+  lastSwing    = 0,
+
+  hold         = 0,      -- CURRENT stall only; reset to 0 on release
+  holding      = false,
+  gate         = nil,    -- plan time of the auto we are waiting on
+  gatePassed   = 0,
+  lastStall    = 0,
+
+  impactAt     = 0,
+  impactDur    = 0.2,
+  impactStrong = false,
+}
+
+local function pushActual(kind, t0, t1)
+  state.actual[#state.actual + 1] = { kind = kind, t0 = t0, t1 = t1 }
+  if #state.actual > 60 then table.remove(state.actual, 1) end
+end
+
+--------------------------------------------------------------------------
+-- Plan: a committed note queue.
+--
+-- Notes are generated once, ahead of time, and never rewritten. The
+-- generator carries its OWN simulated cooldowns forward rather than
+-- reading live ones every frame -- reading live cooldowns is what let a
+-- Multi cast retroactively move notes that were already on screen.
+-- A note, once placed, stays exactly where it is until it scrolls off.
+--------------------------------------------------------------------------
+
+local gen = {
+  seeded  = false,
+  step    = 0,
+  t       = 0,   -- time the next simulated auto lands
+  gcdFree = 0,
+  step    = 0,   -- 0..4 through the French sequence
+  mReady  = 0,
+  aReady  = 0,
+}
+
+-- Rotations keyed to eWS bands from boukx.github.io/rotations. Only the
+-- inputs a band actually uses are ever emitted, so at 1:1 no Multi or
+-- Arcane notes appear at all.
+local ROT = {
+  french = {                       -- 5:5:1:1, eWS 2.8 -> 1.8
+    name = "French 5:5:1:1", len = 5,
+    inst  = { [0] = "multi", [2] = "arcane" },
+    weave = { [1] = true, [3] = true },       -- French 2 weave
+  },
+  fiveSix = {                      -- 5:6:1:1, eWS 1.9 -> 1.7
+    name = "5:6:1:1", len = 6,
+    inst  = { [0] = "arcane", [1] = "multi" },
+    noSteady = { [1] = true },     -- that cycle is auto - multi only
+    weave = { [2] = true, [4] = true },
+  },
+  oneToOne = {                     -- auto - steady, repeat
+    name = "1:1", len = 1,
+    inst = {}, weave = { [0] = true },        -- raptor on cooldown
+  },
+}
+
+local function currentRot()
+  local e = ews()
+  if e >= 1.9 then return ROT.french end
+  if e >= 1.7 then return ROT.fiveSix end
+  return ROT.oneToOne
+end
+
+local function seedGenerator(now)
+  gen.seeded  = true
+  gen.t       = now
+  gen.gcdFree = 0
+  gen.step    = 0
+  state.slew, state.slewTarget = 0, 0
+  state.hold, state.holding = 0, false
+  state.gate, state.gatePassed = nil, 0
+  state.lastStall = 0
+  wipe(state.plan)
+end
+
+-- Emit one ideal cycle starting from an auto landing at gen.t.
+-- Every interval inside the cycle is covered by exactly one segment --
+-- any hole left over is filled with idle, so the track is never blank.
+-- Fixed-sequence generation. The rotation for the current eWS band
+-- decides what goes in each step; nothing here reads a live cooldown,
+-- so a note placed on the track can never be rewritten by anything you
+-- do afterwards. Stability is the whole point.
+local function generateCycle()
+  local sc, mc, ac, rl = steadyCast(), multiCast(), autoCast(), reload()
+  local rot  = currentRot()
+  local step = gen.step % rot.len
+  local t, cyc = gen.t, {}
+
+  local skipSteady = rot.noSteady and rot.noSteady[step]
+  local s0 = math.max(t, gen.gcdFree)
+  local s1 = s0
+
+  if rot.weave[step] and s0 > t + 0.02 then
+    cyc[#cyc+1] = { kind = "weave", t0 = t, t1 = s0 }
+  end
+
+  if not skipSteady then
+    s1 = s0 + sc
+    cyc[#cyc+1] = { kind = "steady", t0 = s0, t1 = s1 }
+    gen.gcdFree = s0 + CONFIG.gcd
+  end
+
+  local busy = s1
+  local inst = rot.inst[step]
+
+  if inst == "multi" then
+    local m0 = math.max(gen.gcdFree, t)
+    local m1 = m0 + mc
+    cyc[#cyc+1] = { kind = "multi", t0 = m0, t1 = m1 }
+    busy = math.max(busy, m1)
+    gen.gcdFree = m0 + CONFIG.gcd
+  elseif inst == "arcane" then
+    local a0 = math.max(gen.gcdFree, t)
+    cyc[#cyc+1] = { kind = "arcane", t0 = a0, t1 = a0 + CONFIG.arcaneWidth }
+    gen.gcdFree = a0 + CONFIG.gcd
+  end
+
+  local a0 = math.max(t + rl, busy)
+  cyc[#cyc+1] = { kind = "auto", t0 = a0, t1 = a0 + ac }
+  local cycleEnd = a0 + ac
+
+  -- Fill every hole so the track has no gaps.
+  table.sort(cyc, function(x, y) return x.t0 < y.t0 end)
+  -- Idle carries the kind that caused it, so it can be drawn as that
+  -- thing's tail rather than as an event in its own right.
+  local out, cursor, prevKind = state.plan, t, nil
+  for _, e in ipairs(cyc) do
+    if e.t0 > cursor + 0.01 then
+      local gap = e.t0 - cursor
+      if gap < CONFIG.idleMin then
+        -- Too short to be worth its own block. Extend the following
+        -- segment back over it so no sliver of track shows through.
+        e.t0 = cursor
+      else
+        out[#out+1] = { kind = "down", t0 = cursor, t1 = e.t0, after = prevKind }
+      end
+    end
+    out[#out+1] = e
+    cursor = math.max(cursor, e.t1)
+    prevKind = e.kind
+  end
+  if cycleEnd > cursor + 0.01 then
+    out[#out+1] = { kind = "down", t0 = cursor, t1 = cycleEnd, after = prevKind }
+  end
+
+  gen.t    = cycleEnd
+  gen.step = (gen.step + 1) % rot.len
+end
+
+-- Absorb a stall by moving the notes rather than by holding a growing
+-- clock offset. Without this, every clip added to `hold` forever and the
+-- timeline drifted further behind real time for the whole fight.
+local function shiftPlan(d)
+  if not d or d <= 0 then return end
+  for _, e in ipairs(state.plan) do
+    e.t0 = e.t0 + d
+    e.t1 = e.t1 + d
+  end
+  gen.t       = gen.t + d
+  gen.gcdFree = gen.gcdFree + d
+  state.gatePassed = state.gatePassed + d
+  if state.gate then state.gate = state.gate + d end
+end
+
+-- Align the sequence to reality at the one moment it is unambiguous:
+-- when you actually cast an instant. Multi is step 1, Arcane is step 3,
+-- so casting one tells us exactly where in the rotation you are.
+--
+-- Notes starting within LOCK_AHEAD are untouched, so nothing near the
+-- line can move. Only the far end is rebuilt, and only on your action --
+-- at most once per instant cast. This is deliberately NOT run on a
+-- timer; doing that is what made the bar thrash.
+local LOCK_AHEAD = 0.7
+
+local function rephase(now, toStep)
+  if not gen.seeded then return end
+
+  local keep, lastEnd = {}, nil
+  for _, e in ipairs(state.plan) do
+    if e.t0 < now + LOCK_AHEAD then
+      keep[#keep+1] = e
+      if e.kind == "auto" and (not lastEnd or e.t1 > lastEnd) then
+        lastEnd = e.t1
+      end
+    end
+  end
+  if not lastEnd then return end
+
+  -- Already in phase: leave the queue completely alone so a clean
+  -- rotation never produces any movement at all.
+  if gen.step == toStep and math.abs(gen.t - lastEnd) < 0.01 then return end
+
+  state.plan = keep
+  gen.t      = lastEnd
+  gen.step   = toStep
+
+  -- Steady has no real cooldown, so its reading is the current GCD.
+  local cs, cd = spellCD(SPELL.steady)
+  local left = (cs and cs > 0) and ((cs + cd) - now) or 0
+  gen.gcdFree = now + (left > 0 and left or 0)
+end
+
+-- Top up the queue to the horizon, then drop what has scrolled past.
+local function advancePlan(now, horizon, tail)
+  if not gen.seeded or ews() <= 0 then return end
+  local guard = 0
+  while gen.t < horizon and guard < 16 do
+    generateCycle()
+    guard = guard + 1
+  end
+  local keep = {}
+  for _, e in ipairs(state.plan) do
+    if e.t1 >= tail then keep[#keep+1] = e end
+  end
+  state.plan = keep
+end
+
+--------------------------------------------------------------------------
+-- Frames
+--------------------------------------------------------------------------
+
+local function heightFor()
+  if CONFIG.showActual then
+    return CONFIG.laneH * 2 + CONFIG.laneGap + CONFIG.pad * 2
+  end
+  return CONFIG.laneH + CONFIG.pad * 2
+end
+
+local totalH = heightFor()
+
+-- An unscaled holder owns the on-screen position; root sits inside it
+-- and is the thing that gets scaled on impact. Scaling a frame that
+-- carries its own SetPoint offsets would drag it across the screen,
+-- because those offsets are read in the frame's own scale.
+local holder = CreateFrame("Frame", "WeaveLineHolder", UIParent)
+holder:SetSize(CONFIG.width, totalH)
+holder:SetPoint("CENTER", UIParent, "CENTER", 0, -170)
+holder:SetMovable(true); holder:EnableMouse(true)
+holder:RegisterForDrag("LeftButton")
+holder:SetScript("OnDragStart", function(self) if IsShiftKeyDown() then self:StartMoving() end end)
+holder:SetScript("OnDragStop", function(self)
+  self:StopMovingOrSizing()
+  local p, _, rp, x, y = self:GetPoint()
+  WeaveLineDB = WeaveLineDB or {}
+  WeaveLineDB.pos = { p, rp, x, y }
+end)
+
+local root = CreateFrame("Frame", "WeaveLineRoot", holder)
+root:SetSize(CONFIG.width, totalH)
+root:SetPoint("CENTER", holder, "CENTER", 0, 0)
+
+local panel = root:CreateTexture(nil, "BACKGROUND", nil, -2)
+panel:SetAllPoints(root)
+panel:SetColorTexture(unpack(C.panel))
+
+local outline = {}
+for i = 1, 4 do
+  local t = root:CreateTexture(nil, "BACKGROUND", nil, -3)
+  t:SetColorTexture(unpack(C.edge)); outline[i] = t
+end
+outline[1]:SetPoint("BOTTOM", root, "TOP", 0, 0)
+outline[2]:SetPoint("TOP", root, "BOTTOM", 0, 0)
+outline[3]:SetPoint("RIGHT", root, "LEFT", 0, 0)
+outline[4]:SetPoint("LEFT", root, "RIGHT", 0, 0)
+
+-- Inset grooves so empty bar still reads as a track.
+local trackTop = root:CreateTexture(nil, "BACKGROUND", nil, -1)
+trackTop:SetColorTexture(unpack(C.track))
+trackTop:SetPoint("TOPLEFT", root, "TOPLEFT", CONFIG.pad, -CONFIG.pad)
+trackTop:SetSize(CONFIG.width - CONFIG.pad*2, CONFIG.laneH)
+
+local trackBot = root:CreateTexture(nil, "BACKGROUND", nil, -1)
+trackBot:SetColorTexture(unpack(C.track))
+trackBot:SetPoint("BOTTOMLEFT", root, "BOTTOMLEFT", CONFIG.pad, CONFIG.pad)
+trackBot:SetSize(CONFIG.width - CONFIG.pad*2, CONFIG.laneH)
+
+local hair = root:CreateTexture(nil, "BORDER")
+hair:SetColorTexture(unpack(C.hairline))
+
+-- Thin highlight along the top inside edge; reads as a lit surface
+-- rather than a flat rectangle.
+local sheen = root:CreateTexture(nil, "OVERLAY", nil, 5)
+sheen:SetColorTexture(unpack(C.sheen))
+
+local planSegs, actualSegs, tickTex = {}, {}, {}
+for i = 1, 48 do
+  local p = root:CreateTexture(nil, "ARTWORK"); p:Hide(); planSegs[i] = p
+  local a = root:CreateTexture(nil, "ARTWORK"); a:Hide(); actualSegs[i] = a
+end
+for i = 1, 64 do
+  local t = root:CreateTexture(nil, "OVERLAY", nil, 4)
+  t:SetColorTexture(unpack(C.tick)); t:Hide(); tickTex[i] = t
+end
+
+-- Black separators sitting at the moment each ability should be pressed.
+-- They double as the visual break between adjacent segments.
+local sepTex = {}
+for i = 1, 32 do
+  local t = root:CreateTexture(nil, "OVERLAY", nil, 5)
+  t:SetColorTexture(unpack(C.sep)); t:Hide(); sepTex[i] = t
+end
+
+-- One line per lane rather than a single bar through both. The break at
+-- the divider keeps the two tracks reading as separate rows.
+-- Impact flash. Above the segments, below the now-lines, and decays to
+-- nothing so it can never be mistaken for a state on the bar itself.
+local flash = root:CreateTexture(nil, "OVERLAY", nil, 6)
+flash:SetColorTexture(1, 1, 1, 1)
+flash:Hide()
+
+-- Swing timer, hugging the bottom border.
+local swingBg = root:CreateTexture(nil, "OVERLAY", nil, 5)
+swingBg:SetColorTexture(unpack(C.swingBg))
+swingBg:Hide()
+
+local swingFill = root:CreateTexture(nil, "OVERLAY", nil, 6)
+swingFill:SetColorTexture(unpack(C.swingUp))
+swingFill:Hide()
+
+local nowTop = root:CreateTexture(nil, "OVERLAY", nil, 7)
+nowTop:SetColorTexture(1, 1, 1, 0.95)
+nowTop:SetSize(CONFIG.lineWidth, CONFIG.laneH + 4)
+
+local nowBot = root:CreateTexture(nil, "OVERLAY", nil, 7)
+nowBot:SetColorTexture(1, 1, 1, 0.95)
+nowBot:SetSize(CONFIG.lineWidth, CONFIG.laneH + 4)
+
+local lblA = root:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+lblA:SetText("|cff6e7385YOU|r")
+
+-- Stats spread across the width instead of crowded into one string.
+local stat = {}
+for i = 1, 4 do
+  stat[i] = root:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+end
+
+
+local rangeLabel = root:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+
+local clipText = root:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+clipText:SetPoint("TOPRIGHT", root, "BOTTOMRIGHT", -2, -4)
+
+--------------------------------------------------------------------------
+-- Range
+--
+-- Classic has no exact distance API, so this is bracketed with the
+-- probes that do exist: Raptor for melee, the duel interact check for
+-- roughly ten yards, and Steady for shooting range.
+--------------------------------------------------------------------------
+
+local function setOutline(c)
+  for i = 1, 4 do outline[i]:SetColorTexture(c[1], c[2], c[3], c[4] or 1) end
+end
+
+-- Range bands, using the probes from [HUNTER] Predictive Melee Weave.
+-- Items have fixed ranges, which is the only reliable distance signal
+-- Classic exposes. Melee is probed with Wing Clip rather than Raptor
+-- Strike -- Raptor is a next-melee-attack ability and its range check
+-- is not trustworthy, which is what made this read melee at distance.
+local RANGE_ITEM = { sweet = 8149, close = 17626, shoot = 18904 }  -- 7 / 10 / 35 yd
+
+-- Items with fixed ranges, nearest first. Same table the range-check
+-- aura uses; it is the only fine-grained distance signal Classic has.
+local RANGE_LADDER = {
+  {  7, 8149  }, { 10, 17626 }, { 15, 33069 }, { 20, 10645 },
+  { 25, 13289 }, { 30, 7734  }, { 35, 18904 },
+}
+local WING_CLIP  = 2974
+
+local function wingClipInRange(u)
+  if C_Spell and C_Spell.IsSpellInRange then
+    local r = C_Spell.IsSpellInRange(WING_CLIP, u)
+    if r ~= nil then return r == true or r == 1 end
+  end
+  if IsSpellInRange then
+    local nm = spellInfo(WING_CLIP)
+    if nm then return IsSpellInRange(nm, u) == 1 end
+  end
+  return nil
+end
+
+-- Second, independent melee probe. Auto Shot has a minimum range, so
+-- being inside 10 yards while Auto Shot reports out-of-range means you
+-- are inside that minimum -- which is melee. The range-check aura uses
+-- exactly this. Two probes disagreeing is worth knowing about, so
+-- /wl range prints both.
+local function autoShotBlocked(u)
+  if not (IsSpellInRange and SPELL.auto) then return nil end
+  if not (IsItemInRange and IsItemInRange(17626, u)) then return false end
+  return IsSpellInRange(SPELL.auto, u) ~= 1
+end
+
+local function inMelee(u)
+  local wc = wingClipInRange(u)
+  if wc then return true end
+  if CONFIG.meleeUseAutoShot and autoShotBlocked(u) then return true end
+  return false
+end
+
+local function itemInRange(id, u)
+  return IsItemInRange and IsItemInRange(id, u) and true or false
+end
+
+local function rangeState()
+  local u = "target"
+  if not UnitExists(u) or not UnitCanAttack("player", u) or UnitIsDead(u) then
+    return nil
+  end
+  if inMelee(u)                            then return "melee"  end
+  if itemInRange(RANGE_ITEM.sweet, u)      then return "sweet"  end
+  if itemInRange(RANGE_ITEM.shoot, u)      then return "ranged" end
+  return "far"
+end
+
+local RANGE_COLOR = {
+  melee  = "rngMelee",
+  sweet  = "rngStep",
+  ranged = "rngRanged",
+  far    = "rngFar",
+}
+
+-- Bracket the target between two rungs of the ladder.
+local function rangeText()
+  local u = "target"
+  if not UnitExists(u) or not UnitCanAttack("player", u) or UnitIsDead(u) then
+    return ""
+  end
+  if inMelee(u) then return "melee" end
+  local prev = 0
+  for _, r in ipairs(RANGE_LADDER) do
+    if itemInRange(r[2], u) then
+      return string.format("%d-%d yd", prev, r[1])
+    end
+    prev = r[1]
+  end
+  return "35+ yd"
+end
+
+local function rangeColor()
+  local st = rangeState()
+  if not st then return C.edge end
+  return C[RANGE_COLOR[st]] or C.edge
+end
+
+--------------------------------------------------------------------------
+-- Layout. Single place that knows how tall things are, so toggling the
+-- YOU lane cannot leave anchors stale.
+--------------------------------------------------------------------------
+
+local innerW
+
+local function layout()
+  totalH = heightFor()
+  innerW = CONFIG.width - CONFIG.pad * 2
+  holder:SetSize(CONFIG.width, totalH)
+  root:SetSize(CONFIG.width, totalH)
+
+  local b = CONFIG.border
+  outline[1]:SetSize(CONFIG.width + b * 2, b)
+  outline[2]:SetSize(CONFIG.width + b * 2, b)
+  outline[3]:SetSize(b, totalH + b * 2)
+  outline[4]:SetSize(b, totalH + b * 2)
+
+  local sy = -(CONFIG.border + CONFIG.swingGap)
+  swingBg:ClearAllPoints()
+  swingBg:SetPoint("TOPLEFT", root, "BOTTOMLEFT", 0, sy)
+  swingBg:SetSize(CONFIG.width, CONFIG.swingH)
+
+  swingFill:ClearAllPoints()
+  swingFill:SetPoint("TOPLEFT", root, "BOTTOMLEFT", 0, sy)
+  swingFill:SetHeight(CONFIG.swingH)
+
+  sheen:ClearAllPoints()
+  sheen:SetPoint("TOPLEFT", root, "TOPLEFT", 1, -1)
+  sheen:SetPoint("TOPRIGHT", root, "TOPRIGHT", -1, -1)
+  sheen:SetHeight(1)
+
+  trackBot:ClearAllPoints()
+  trackBot:SetPoint("BOTTOMLEFT", root, "BOTTOMLEFT", CONFIG.pad, CONFIG.pad)
+  trackBot:SetSize(innerW, CONFIG.laneH)
+
+  nowBot:ClearAllPoints()
+  nowBot:SetSize(CONFIG.lineWidth, CONFIG.laneH + 3)
+  nowBot:SetPoint("BOTTOM", root, "BOTTOM", 0, CONFIG.pad - 1)
+
+  flash:ClearAllPoints(); flash:SetAllPoints(root)
+
+  -- Clip readout above the bar; stats spread along the bottom.
+  -- Text must clear the border AND the swing bar beneath it, otherwise
+  -- the stats run through the fill.
+  local swingSpace = CONFIG.swingBar and (CONFIG.swingGap + CONFIG.swingH) or 0
+  local tg = CONFIG.border + swingSpace + CONFIG.textGap
+  clipText:ClearAllPoints()
+  clipText:SetPoint("BOTTOMRIGHT", root, "TOPRIGHT", -2, tg)
+  rangeLabel:ClearAllPoints()
+  rangeLabel:SetPoint("BOTTOMLEFT", root, "TOPLEFT", 2, tg)
+
+  for i = 1, 4 do
+    stat[i]:ClearAllPoints()
+    local frac = (i - 1) / 3
+    if i == 1 then
+      stat[i]:SetPoint("TOPLEFT", root, "BOTTOMLEFT", 2, -tg)
+    elseif i == 4 then
+      stat[i]:SetPoint("TOPRIGHT", root, "BOTTOMRIGHT", -2, -tg)
+    else
+      stat[i]:SetPoint("TOP", root, "BOTTOMLEFT", CONFIG.width * frac, -tg)
+    end
+  end
+
+  if CONFIG.showActual then
+    trackTop:Show()
+    trackTop:ClearAllPoints()
+    trackTop:SetPoint("TOPLEFT", root, "TOPLEFT", CONFIG.pad, -CONFIG.pad)
+    trackTop:SetSize(innerW, CONFIG.laneH)
+
+    hair:Show()
+    hair:ClearAllPoints()
+    hair:SetSize(innerW, 1)
+    hair:SetPoint("CENTER", root, "CENTER", 0, 0)
+
+    nowTop:Show()
+    nowTop:ClearAllPoints()
+    nowTop:SetSize(CONFIG.lineWidth, CONFIG.laneH + 3)
+    nowTop:SetPoint("TOP", root, "TOP", 0, -(CONFIG.pad - 1))
+
+    lblA:Show()
+    lblA:ClearAllPoints()
+    lblA:SetPoint("RIGHT", root, "TOPLEFT", -(CONFIG.border + 6),
+                  -(CONFIG.pad + CONFIG.laneH * 0.5))
+  else
+    trackTop:Hide(); hair:Hide(); nowTop:Hide(); lblA:Hide()
+  end
+end
+
+--------------------------------------------------------------------------
+-- Geometry
+--------------------------------------------------------------------------
+
+local pps, lineX, lookahead, lookbehind
+
+local function recomputeGeometry()
+  local speed = ews(); if speed <= 0 then speed = 2.0 end
+  lookahead = CONFIG.cycles * speed
+  local p = math.min(0.9, math.max(0.05, CONFIG.linePos))
+  lookbehind = lookahead * p / (1 - p)
+  pps   = innerW / (lookahead + lookbehind)
+  lineX = -(innerW / 2) + innerW * p
+  nowTop:ClearAllPoints()
+  nowTop:SetPoint("TOP", root, "TOP", lineX, -(CONFIG.pad - 1))
+  nowBot:ClearAllPoints()
+  nowBot:SetPoint("BOTTOM", root, "BOTTOM", lineX, CONFIG.pad - 1)
+end
+layout()
+recomputeGeometry()
+
+local function xFor(t, now) return lineX + ((t + state.slew) - now) * pps end
+
+--------------------------------------------------------------------------
+-- Render
+--------------------------------------------------------------------------
+
+local function ms(v)
+  if type(v) ~= "number" or v ~= v then return "0" end
+  v = v * 1000
+  if v < -9999 then v = -9999 elseif v > 9999 then v = 9999 end
+  return string.format("%.0f", v)
+end
+
+local function render()
+  local real  = GetTime()
+  -- Timeline clock. Stops advancing while gated, so the track holds at
+  -- the auto shot instead of running ahead of you.
+  local now   = real - state.hold
+  local halfW = innerW / 2
+  recomputeGeometry()
+
+  local nP, nA, nT, nS = 0, 0, 0, 0
+
+  local function seg(pool, count, e, lane)
+    if count >= #pool then return count end
+
+    local col = C[e.kind]
+    local idle = (e.kind == "down")
+    if idle then
+      if CONFIG.idleStyle == "hidden" then return count end
+      if (e.t1 - e.t0) < CONFIG.idleMin then return count end
+      if CONFIG.idleStyle == "tail" then
+        -- Borrow the colour of whatever is still holding you.
+        col = C[e.after or "steady"] or C.down
+      end
+    end
+    if not col then return count end
+    local x0 = math.max(xFor(e.t0, now), -halfW)
+    local x1 = math.min(xFor(e.t1, now),  halfW)
+    if x1 - x0 <= 0.5 then return count end
+    count = count + 1
+    local z = pool[count]
+    local past = (e.t1 < now)
+    local a
+    if idle then
+      a = (CONFIG.idleStyle == "tail") and CONFIG.idleTailAlpha or 0.75
+    else
+      a = 0.98
+    end
+    if past then a = a * 0.32 end
+    paint(z, col, a)
+    z:ClearAllPoints()
+    local h = idle and math.max(2, CONFIG.laneH * CONFIG.idleHeight) or CONFIG.laneH
+    z:SetSize(x1 - x0, h)
+    local cx = x0 + (x1 - x0) / 2
+    if lane == "TOP" then
+      z:SetPoint("CENTER", root, "TOP", cx, -(CONFIG.pad + CONFIG.laneH * 0.5))
+    else
+      z:SetPoint("CENTER", root, "BOTTOM", cx, CONFIG.pad + CONFIG.laneH * 0.5)
+    end
+    z:Show()
+    return count
+  end
+
+  -- Split per lane, and coloured to match the input it introduces, so a
+  -- glance at the line tells you which button is coming.
+  local function tick(t, kind)
+    if not CONFIG.ticks or nT + 1 >= #tickTex then return end
+    local x = xFor(t, now)
+    if x < -halfW or x > halfW then return end
+    local c = C[kind] or C.tick
+    local lanes = CONFIG.showActual and { "TOP", "BOTTOM" } or { "BOTTOM" }
+    for _, lane in ipairs(lanes) do
+      nT = nT + 1
+      local z = tickTex[nT]
+      z:SetColorTexture(c[1], c[2], c[3], 0.95)
+      z:ClearAllPoints(); z:SetSize(2, CONFIG.laneH)
+      if lane == "TOP" then z:SetPoint("TOP", root, "TOP", x, -CONFIG.pad)
+      else                  z:SetPoint("BOTTOM", root, "BOTTOM", x, CONFIG.pad) end
+      z:Show()
+    end
+  end
+
+  -- Notes are drawn at (t + slew), so the window in NOTE time is
+  -- shifted by -slew. Generating against the unshifted window leaves the
+  -- track short at one edge whenever the correction is large.
+  advancePlan(now - state.slew, now - state.slew + lookahead + 1,
+              now - state.slew - lookbehind - 1)
+
+  -- Gating only makes sense while shots are actually landing. Idle, the
+  -- timeline would reach a gate, stall for the full cap, time out and
+  -- repeat -- a stutter every gateMax seconds. Three cycles of slack so
+  -- the weave macro toggling attack off does not trip it.
+  local shooting = state.lastAuto > 0
+                   and (real - state.lastAuto) < (ews() * 3)
+
+  if CONFIG.gateOnAuto and shooting then
+    local g
+    for _, e in ipairs(state.plan) do
+      if e.kind == "auto" and e.t1 > state.gatePassed + 0.01 then
+        if not g or e.t1 < g then g = e.t1 end
+      end
+    end
+    state.gate = g
+
+    local reached = g and ((g + state.slew) <= now)
+    if reached then
+      -- hold IS the current stall length; it resets to zero on release,
+      -- so it can never accumulate across cycles.
+      state.holding = state.hold < CONFIG.gateMax
+      if not state.holding and state.hold > 0 then
+        -- Timed out waiting. Absorb what we held and let it run on.
+        shiftPlan(state.hold)
+        state.hold = 0
+        state.gatePassed = g
+      end
+    else
+      state.holding = false
+    end
+  else
+    state.holding = false
+  end
+  -- A separator marks the instant the NEXT ability wants pressing, so
+  -- it lands on the leading edge of every actionable segment.
+  -- Coloured to match the input it introduces, lightened so it still
+  -- reads as an edge against that input rather than merging into it.
+  local function sep(t, kind)
+    if not CONFIG.separators or nS >= #sepTex then return end
+    local x = xFor(t, now)
+    if x < -halfW or x > halfW then return end
+    nS = nS + 1
+    local z = sepTex[nS]
+    local c = C[kind] or C.sep
+    local k = CONFIG.sepBright
+    z:SetColorTexture(c[1] + (1 - c[1]) * k,
+                      c[2] + (1 - c[2]) * k,
+                      c[3] + (1 - c[3]) * k, 1)
+    z:ClearAllPoints()
+    z:SetSize(CONFIG.sepWidth, CONFIG.laneH + CONFIG.sepOverhang * 2)
+    z:SetPoint("CENTER", root, "BOTTOM", x, CONFIG.pad + CONFIG.laneH * 0.5)
+    z:Show()
+  end
+
+  -- Notes are drawn at (t + slew), so the visibility test has to use the
+  -- same shift. Testing raw t was blanking the bar whenever the phase
+  -- correction grew.
+  for _, e in ipairs(state.plan) do
+    if (e.t1 + state.slew) > now - lookbehind
+       and (e.t0 + state.slew) < now + lookahead then
+      if e.kind ~= "down" or CONFIG.showIdle then
+        nP = seg(planSegs, nP, e, "BOTTOM")
+      end
+      if e.kind == "steady" or e.kind == "multi"
+         or e.kind == "arcane" or e.kind == "weave" then
+        sep(e.t0, e.kind)
+      end
+      if e.kind ~= "down" and e.t0 >= now then tick(e.t0, e.kind) end
+    end
+  end
+
+  if CONFIG.showActual then
+    for _, e in ipairs(state.actual) do
+      if (e.t1 + state.slew) > now - lookbehind
+         and (e.t0 + state.slew) < now + lookahead then
+        nA = seg(actualSegs, nA, e, "TOP")
+      end
+    end
+  end
+
+  for i = nP + 1, #planSegs   do planSegs[i]:Hide()   end
+  for i = nA + 1, #actualSegs do actualSegs[i]:Hide() end
+  for i = nT + 1, #tickTex    do tickTex[i]:Hide()    end
+  for i = nS + 1, #sepTex     do sepTex[i]:Hide()     end
+
+  -- Impact flash decays over its window; the outline rides along with it
+  -- and drops straight back to the range colour once it is done.
+  -- Impact. Full brightness on the first frame then a hard cubic decay,
+  -- so it lands as a hit rather than a fade. The border thickens and the
+  -- now-line swells at the same time; three things moving together is
+  -- what makes it feel like contact instead of a colour change.
+  local rc = rangeColor()
+  local popped = false
+  if state.impactAt > 0 then
+    local left = 1 - ((real - state.impactAt) / state.impactDur)
+    if left > 0 then
+      local strong = state.impactStrong
+      local e2 = left * left
+
+      -- The scale pop is the primary cue. Full size on the first frame,
+      -- then settling back -- a swell you feel rather than a flicker you
+      -- have to catch. Everything else rides along with it.
+      local amt = CONFIG.impactScale * (strong and 1.0 or 0.6) * e2
+      root:SetScale(1 + amt)
+
+      local blink = 0.5 + 0.5 * math.cos((1 - left) * math.pi * 2 * CONFIG.impactBlinks)
+      local a = math.min(1, CONFIG.impactPeak * (strong and 1.0 or 0.6)
+                            * e2 * (0.5 + 0.5 * blink))
+      local g = 0.75 + 0.25 * blink
+      flash:SetColorTexture(g, g, g, a)
+      flash:Show()
+
+      local m = e2 * (strong and 0.9 or 0.6)
+      rc = { rc[1] + (1 - rc[1]) * m, rc[2] + (1 - rc[2]) * m, rc[3] + (1 - rc[3]) * m, 1 }
+
+      local pop = math.floor(CONFIG.impactPop * e2 * (strong and 1.0 or 0.6) + 0.5)
+      if pop > 0 then
+        local b = CONFIG.border + pop
+        outline[1]:SetSize(CONFIG.width + b*2, b)
+        outline[2]:SetSize(CONFIG.width + b*2, b)
+        outline[3]:SetSize(b, totalH + b*2)
+        outline[4]:SetSize(b, totalH + b*2)
+        popped = true
+      end
+    else
+      state.impactAt = 0
+      flash:Hide()
+      root:SetScale(1)
+    end
+  elseif root:GetScale() ~= 1 then
+    root:SetScale(1)
+  end
+
+  if not popped and state.impactAt == 0 then
+    local b = CONFIG.border
+    outline[1]:SetSize(CONFIG.width + b*2, b)
+    outline[2]:SetSize(CONFIG.width + b*2, b)
+    outline[3]:SetSize(b, totalH + b*2)
+    outline[4]:SetSize(b, totalH + b*2)
+    nowBot:SetWidth(CONFIG.lineWidth)
+  end
+  setOutline(rc)
+
+  -- Swing timer. Fills across as the swing recharges, empties the moment
+  -- it lands. Real time, not the timeline clock: swings do not pause
+  -- when the gate holds.
+  if CONFIG.swingBar and state.lastSwing > 0 then
+    local sp = meleeSpeed()
+    local since = real - state.lastSwing
+    if since < sp * CONFIG.swingStale then
+      local pct = since / sp
+      if pct > 1 then pct = 1 end
+      -- Green while Raptor is available, grey while it is not: the fill
+      -- then tells you both when the swing lands and whether it is worth
+      -- stepping in for.
+      local rc = (cdLeft(SPELL.raptor) <= 0) and C.swingUp or C.swingCd
+      swingFill:SetColorTexture(rc[1], rc[2], rc[3], rc[4])
+      swingBg:Show()
+      swingFill:SetWidth(math.max(1, CONFIG.width * pct))
+      swingFill:Show()
+    else
+      swingBg:Hide(); swingFill:Hide()
+    end
+  else
+    swingBg:Hide(); swingFill:Hide()
+  end
+
+  stat[1]:SetText(string.format("|cff9aa0b0eWS|r  %.2f", ews()))
+  stat[2]:SetText(string.format("|cffd8dce6%s|r", currentRot().name))
+  -- "steady" names which cast this is; "gap" is what is left of the
+  -- 1500ms GCD once that cast finishes. The two always sum to the GCD,
+  -- which is why showing the GCD itself would say nothing.
+  stat[3]:SetText(string.format("|cffffffffsteady  %sms|r", ms(steadyCast())))
+
+  -- Gap is tinted like the dim tail it corresponds to on the bar.
+  local sc = C.steady
+  stat[4]:SetText(string.format("|cff%02x%02x%02xgap  %sms|r",
+    math.floor(sc[1] * 0.70 * 255), math.floor(sc[2] * 0.70 * 255),
+    math.floor(sc[3] * 0.70 * 255), ms(CONFIG.gcd - steadyCast())))
+  local rt = rangeText()
+  if rt == "" then
+    rangeLabel:SetText("")
+  else
+    local c = rangeColor()
+    rangeLabel:SetText(string.format("|cff%02x%02x%02x%s|r",
+      math.floor(c[1]*255), math.floor(c[2]*255), math.floor(c[3]*255), rt))
+  end
+
+  if state.holding then
+    clipText:SetText("|cffffcc33WAITING|r")
+  elseif state.lastStall > 0.02 then
+    clipText:SetText("|cffff6b6bclip " .. ms(state.lastStall) .. "ms|r")
+  elseif state.lastClip > 0.02 then
+    clipText:SetText("|cffff6b6bclip " .. ms(state.lastClip) .. "ms|r")
+  else
+    clipText:SetText("|cff5fd97fclean|r")
+  end
+end
+
+local lastHostile = 0
+
+local function updateVisibility()
+  local t = "target"
+  local now = GetTime()
+  local hostile = UnitExists(t) and UnitCanAttack("player", t) and not UnitIsDead(t)
+  if hostile then lastHostile = now end
+
+  local since = now - lastHostile
+
+  if hostile then
+    holder:Show()
+    holder:SetAlpha(UnitAffectingCombat("player") and 1.0 or CONFIG.idleAlpha)
+  elseif since < CONFIG.noTargetFade then
+    -- Grace window: losing a target mid-fight should not blink the bar
+    -- out, so ease down over the fade period instead.
+    local k = 1 - (since / CONFIG.noTargetFade)
+    local full = UnitAffectingCombat("player") and 1.0 or CONFIG.idleAlpha
+    holder:Show()
+    holder:SetAlpha(CONFIG.idleAlpha + (full - CONFIG.idleAlpha) * k)
+  elseif not CONFIG.hideNoTarget then
+    holder:Show(); holder:SetAlpha(CONFIG.idleAlpha)
+  else
+    holder:Hide()
+  end
+end
+
+local visAcc = 0
+local acc = 0
+root:SetScript("OnUpdate", function(self, dt)
+  if state.holding then state.hold = state.hold + dt end
+
+  if CONFIG.phaseLock and state.slew ~= state.slewTarget then
+    local d = state.slewTarget - state.slew
+    local rate = math.max(CONFIG.slewRate, math.abs(d) / CONFIG.slewTime)
+    local step = rate * dt
+    if math.abs(d) <= step then
+      state.slew = state.slewTarget
+    else
+      state.slew = state.slew + (d > 0 and step or -step)
+    end
+  end
+  visAcc = visAcc + dt
+  if visAcc > 0.2 then
+    visAcc = 0
+    updateVisibility()
+  end
+  acc = acc + dt
+  if acc < (1/60) then return end
+  acc = 0
+  render()
+end)
+
+--------------------------------------------------------------------------
+-- Events
+--------------------------------------------------------------------------
+
+root:RegisterEvent("PLAYER_LOGIN")
+root:RegisterEvent("UNIT_SPELLCAST_START")
+root:RegisterEvent("UNIT_SPELLCAST_SUCCEEDED")
+root:RegisterEvent("START_AUTOREPEAT_SPELL")
+root:RegisterEvent("STOP_AUTOREPEAT_SPELL")
+root:RegisterEvent("PLAYER_REGEN_ENABLED")
+root:RegisterEvent("PLAYER_REGEN_DISABLED")
+root:RegisterEvent("PLAYER_TARGET_CHANGED")
+root:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+
+root:SetScript("OnEvent", function(self, event, ...)
+  if event == "PLAYER_LOGIN" then
+    resolve()
+    if WeaveLineDB and WeaveLineDB.pos then
+      local p, rp, x, y = unpack(WeaveLineDB.pos)
+      holder:ClearAllPoints(); holder:SetPoint(p, UIParent, rp, x, y)
+    end
+
+  elseif event == "START_AUTOREPEAT_SPELL" or event == "STOP_AUTOREPEAT_SPELL" then
+    -- Deliberately does nothing to the queue. The weave macro toggles
+    -- attack every time you step in, and wiping here is what made the
+    -- bar go blank mid-fight. The plan is free-running; it keeps going.
+
+  elseif event == "UNIT_SPELLCAST_START" then
+    local unit, _, spellID = ...
+    if unit ~= "player" then return end
+    local nm, now = spellInfo(spellID), GetTime()
+    if nm == SPELL.steady or nm == SPELL.multi then
+      -- The timeline begins on your first input, not on entering combat,
+      -- so the opener lines up with the start of the sequence.
+      if not gen.seeded then seedGenerator(now) end
+      if nm == SPELL.steady then
+        pushActual("steady", now, now + steadyCast())
+      else
+        pushActual("multi", now, now + multiCast())
+        rephase(now, 1)   -- Multi is step 1; next cycle is step 2
+      end
+    end
+
+  elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+    local unit, _, spellID = ...
+    if unit ~= "player" then return end
+    local nm, now = spellInfo(spellID), GetTime()
+    if nm == SPELL.auto then
+      if state.lastAuto > 0 then
+        local c = now - (state.lastAuto + ews())
+        state.lastClip = (c > 0 and c < ews()) and c or 0
+      end
+      state.lastAuto = now
+      -- Seeded once. Later autos never touch the generator, so committed
+      -- notes stay put; alignment is handled by the slew instead.
+      if not gen.seeded then seedGenerator(now) end
+      pushActual("auto", now - autoCast(), now)
+
+      -- Release the gate. Whatever time was spent held is exactly how
+      -- much this shot clipped, which is worth surfacing.
+      if CONFIG.gateOnAuto and state.gate then
+        state.lastStall  = state.hold
+        state.gatePassed = state.gate
+        shiftPlan(state.hold)     -- absorb the stall into the notes
+        state.hold       = 0
+        state.holding    = false
+      end
+
+      -- Compare this real auto against the nearest planned one and
+      -- retarget the slew. Wrapped to +/- half a cycle so we correct
+      -- phase, never jump a whole cycle.
+      if CONFIG.phaseLock then
+        local speed = ews()
+        local tnow  = now - state.hold
+        local best
+        for _, e in ipairs(state.plan) do
+          if e.kind == "auto" then
+            local d = math.abs((e.t1 + state.slew) - tnow)
+            if not best or d < best.d then best = { d = d, t = e.t1 } end
+          end
+        end
+        if best and speed > 0 then
+          local err = tnow - (best.t + state.slew)
+          err = err - math.floor(err / speed + 0.5) * speed
+          state.slewTarget = state.slew + err
+          state.lastPhaseErr = err
+          if CONFIG.debug then
+            print(string.format("|cff88ccffWL|r phase err %sms  slew %sms",
+              ms(err), ms(state.slewTarget)))
+          end
+        end
+      end
+    elseif nm == SPELL.arcane then
+      pushActual("arcane", now, now + CONFIG.arcaneWidth)
+      rephase(now, 3)   -- Arcane is step 3; next cycle is step 4
+    end
+
+  elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
+    local _, sub, _, srcGUID, _, _, _, _, _, _, _, a12, a13 = CombatLogGetCurrentEventInfo()
+    if srcGUID ~= UnitGUID("player") then return end
+
+    if sub == "SWING_DAMAGE" or sub == "SWING_MISSED" then
+      state.impactAt, state.impactDur, state.impactStrong =
+        GetTime(), CONFIG.impactMelee, false
+      state.lastSwing = GetTime()
+      if CONFIG.debug then print("|cff88ccffWL|r impact: melee swing") end
+    elseif sub == "SPELL_DAMAGE" or sub == "SPELL_MISSED"
+        or sub == "SPELL_CAST_SUCCESS" then
+      -- Anniversary sends localized names; Era sends ids. Handle both.
+      -- CAST_SUCCESS is included so a Raptor that misses still registers.
+      local nm = a13
+      if not nm and type(a12) == "number" then nm = spellInfo(a12) end
+      if nm == SPELL.raptor then
+        state.impactAt, state.impactDur, state.impactStrong =
+          GetTime(), CONFIG.impactRaptor, true
+        -- Raptor rides the swing, so it consumes one.
+        state.lastSwing = GetTime()
+        if CONFIG.debug then print("|cff88ccffWL|r impact: raptor (" .. sub .. ")") end
+      end
+    end
+
+  elseif event == "PLAYER_TARGET_CHANGED" then
+    updateVisibility()
+
+  elseif event == "PLAYER_REGEN_DISABLED" then
+    updateVisibility()
+
+  elseif event == "PLAYER_REGEN_ENABLED" then
+    state.lastClip = 0
+    -- Drop out of combat and the next opener re-seeds from scratch.
+    gen.seeded = false
+    wipe(state.plan); wipe(state.actual)
+    updateVisibility()
+  end
+end)
+
+--------------------------------------------------------------------------
+-- Slash
+--------------------------------------------------------------------------
+
+SLASH_WEAVELINE1 = "/weaveline"
+SLASH_WEAVELINE2 = "/wl"
+SlashCmdList["WEAVELINE"] = function(msg)
+  local cmd, rest = msg:match("^(%S*)%s*(.-)$")
+  cmd = (cmd or ""):lower(); local v = tonumber(rest)
+
+  if cmd == "width" and v then
+    CONFIG.width = v; root:SetWidth(v); innerW = v - CONFIG.pad*2
+    trackTop:SetWidth(innerW); trackBot:SetWidth(innerW); hair:SetWidth(innerW)
+    recomputeGeometry()
+  elseif cmd == "cycles" and v then CONFIG.cycles = v; recomputeGeometry()
+  elseif cmd == "linepos" and v then CONFIG.linePos = v; recomputeGeometry()
+  elseif cmd == "linewidth" and v then
+    CONFIG.lineWidth = v
+    nowTop:SetSize(v, CONFIG.laneH + 4); nowBot:SetSize(v, CONFIG.laneH + 4)
+  elseif cmd == "ticks" then CONFIG.ticks = not CONFIG.ticks
+  elseif cmd == "idlestyle" then
+    CONFIG.idleStyle = (CONFIG.idleStyle == "tail" and "block")
+                    or (CONFIG.idleStyle == "block" and "hidden") or "tail"
+    print("|cff88ccffWL|r idle style: " .. CONFIG.idleStyle)
+  elseif cmd == "idlemin" and v then
+    CONFIG.idleMin = v
+    print("|cff88ccffWL|r hiding idles under " .. ms(v) .. "ms")
+  elseif cmd == "idlealphatail" and v then
+    CONFIG.idleTailAlpha = v
+  elseif cmd == "sepbright" and v then
+    CONFIG.sepBright = v
+  elseif cmd == "sepoverhang" and v then
+    CONFIG.sepOverhang = v
+    print("|cff88ccffWL|r separator overhang " .. v .. "px")
+
+  elseif cmd == "swing" then
+    CONFIG.swingBar = not CONFIG.swingBar
+    print("|cff88ccffWL|r swing timer " .. tostring(CONFIG.swingBar))
+  elseif cmd == "swingh" and v then
+    CONFIG.swingH = v; layout()
+  elseif cmd == "swinggap" and v then
+    CONFIG.swingGap = v; layout()
+    print("|cff88ccffWL|r swing bar " .. v .. "px below the border")
+
+  elseif cmd == "gate" then
+    CONFIG.gateOnAuto = not CONFIG.gateOnAuto
+    if not CONFIG.gateOnAuto then
+      state.holding, state.stallStarted = false, false
+    end
+    print("|cff88ccffWL|r hold-at-auto " .. tostring(CONFIG.gateOnAuto))
+  elseif cmd == "gatemax" and v then
+    CONFIG.gateMax = v
+    print("|cff88ccffWL|r max stall " .. v .. "s")
+
+  elseif cmd == "phaselock" then
+    CONFIG.phaseLock = not CONFIG.phaseLock
+    if not CONFIG.phaseLock then state.slew, state.slewTarget = 0, 0 end
+    print("|cff88ccffWL|r phase lock " .. tostring(CONFIG.phaseLock))
+  elseif cmd == "slewtime" and v then
+    CONFIG.slewTime = v
+    print("|cff88ccffWL|r phase corrections settle in " .. v .. "s")
+  elseif cmd == "slewrate" and v then
+    CONFIG.slewRate = v
+
+  elseif cmd == "seps" then
+    CONFIG.separators = not CONFIG.separators
+    print("|cff88ccffWL|r input separators " .. tostring(CONFIG.separators))
+  elseif cmd == "sepwidth" and v then
+    CONFIG.sepWidth = v
+  elseif cmd == "actual" then
+    CONFIG.showActual = not CONFIG.showActual
+    layout(); recomputeGeometry()
+    print("|cff88ccffWL|r YOU lane " .. (CONFIG.showActual and "on" or "off"))
+  elseif cmd == "laneh" and v then
+    CONFIG.laneH = v; layout(); recomputeGeometry()
+  elseif cmd == "idlealpha" and v then
+    CONFIG.idleAlpha = v; updateVisibility()
+  elseif cmd == "alwaysshow" then
+    CONFIG.hideNoTarget = not CONFIG.hideNoTarget; updateVisibility()
+    print("|cff88ccffWL|r hide with no target: " .. tostring(CONFIG.hideNoTarget))
+  elseif cmd == "gloss" then CONFIG.gloss = not CONFIG.gloss
+  elseif cmd == "squarehaste" then
+    CONFIG.squareHaste = not CONFIG.squareHaste
+    print("|cff88ccffWL|r squareHaste " .. tostring(CONFIG.squareHaste))
+  elseif cmd == "sync" then
+    seedGenerator(GetTime())
+    print("|cff88ccffWL|r plan regenerated from now")
+  elseif cmd == "check" then
+    print(string.format("|cff88ccffWL|r eWS %.3f haste %.3f", ews(), haste()))
+    print(string.format("  steady %sms  multi %sms  auto %sms  reload %sms  gap %sms",
+      ms(steadyCast()), ms(multiCast()), ms(autoCast()), ms(reload()),
+      ms(CONFIG.gcd - steadyCast())))
+    print(string.format("  rotation %s  step %d/%d  notes %d",
+      currentRot().name, gen.step + 1, currentRot().len, #state.plan))
+    print(string.format("  gate %s  holding=%s  last stall %sms",
+      state.gate and "armed" or "none", tostring(state.holding), ms(state.lastStall)))
+    print(string.format("  phase slew %sms  target %sms  last err %sms  (lock %s)",
+      ms(state.slew), ms(state.slewTarget), ms(state.lastPhaseErr),
+      tostring(CONFIG.phaseLock)))
+    print(string.format("  multi cd %.1f  arcane cd %.1f",
+      cdLeft(SPELL.multi), cdLeft(SPELL.arcane)))
+  elseif cmd == "border" and v then
+    CONFIG.border = v; layout()
+    print("|cff88ccffWL|r border " .. v .. "px")
+  elseif cmd == "flash" and v then
+    CONFIG.impactMelee = v; CONFIG.impactRaptor = v * 1.6
+  elseif cmd == "scale" and v then
+    CONFIG.impactScale = v
+    print("|cff88ccffWL|r impact swell " .. math.floor(v * 100) .. "%")
+  elseif cmd == "peak" and v then
+    CONFIG.impactPeak = v; print("|cff88ccffWL|r impact peak " .. v)
+  elseif cmd == "pop" and v then
+    CONFIG.impactPop = v; print("|cff88ccffWL|r border pop " .. v .. "px")
+  elseif cmd == "punch" and v then
+    CONFIG.impactScale = v
+    print("|cff88ccffWL|r impact expansion " .. math.floor(v * 100) .. "%")
+  elseif cmd == "idleheight" and v then
+    CONFIG.idleHeight = v
+    print("|cff88ccffWL|r impact flash " .. ms(v) .. "ms")
+  elseif cmd == "testflash" then
+    state.impactAt, state.impactDur, state.impactStrong =
+      GetTime(), CONFIG.impactRaptor, true
+
+  elseif cmd == "idle" then
+    CONFIG.showIdle = not CONFIG.showIdle
+    print("|cff88ccffWL|r idle GCD segments " .. (CONFIG.showIdle and "shown" or "hidden"))
+
+  elseif cmd == "meleeprobe" then
+    CONFIG.meleeUseAutoShot = not CONFIG.meleeUseAutoShot
+    print("|cff88ccffWL|r auto-shot melee probe: " .. tostring(CONFIG.meleeUseAutoShot))
+  elseif cmd == "textgap" and v then
+    CONFIG.textGap = v; layout()
+
+  elseif cmd == "gaps" then
+    local n, worst = 0, 0
+    for i = 2, #state.plan do
+      local g = state.plan[i].t0 - state.plan[i-1].t1
+      if g > 0.005 then
+        n = n + 1
+        if g > worst then worst = g end
+        if n <= 5 then
+          print(string.format("  gap %sms between %s and %s",
+            ms(g), state.plan[i-1].kind, state.plan[i].kind))
+        end
+      end
+    end
+    print(string.format("|cff88ccffWL|r %d notes, %d time gaps, worst %sms",
+      #state.plan, n, ms(worst)))
+
+  elseif cmd == "range" then
+    local u = "target"
+    if not UnitExists(u) then
+      print("|cff88ccffWL|r no target")
+    else
+      print(string.format("|cff88ccffWL|r state=%s  text=%s",
+        tostring(rangeState()), rangeText()))
+      print(string.format("  wingclip=%s  autoshot-blocked=%s  ->melee=%s",
+        tostring(wingClipInRange(u)), tostring(autoShotBlocked(u)),
+        tostring(inMelee(u))))
+      local parts = {}
+      for _, r in ipairs(RANGE_LADDER) do
+        parts[#parts+1] = string.format("%dyd=%s", r[1], tostring(itemInRange(r[2], u)))
+      end
+      print("  " .. table.concat(parts, "  "))
+    end
+
+  elseif cmd == "lock"   then holder:EnableMouse(false)
+  elseif cmd == "unlock" then holder:EnableMouse(true)
+  else
+    print("|cff88ccffWL|r check | gaps | range | idle | meleeprobe | textgap | border | flash | scale | peak | pop | punch | idleheight | testflash | sync | actual | laneh | idlealpha | alwaysshow | width | cycles | linepos | ticks | seps | sepwidth | swing | swingh | swinggap | gate | gatemax | phaselock | slewtime | sepbright | sepoverhang | idlestyle | idlemin | gloss | squarehaste | lock | unlock")
+  end
+end
